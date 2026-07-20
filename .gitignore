@@ -1,0 +1,4 @@
+.env
+reminders.db
+__pycache__/
+*.pyc
