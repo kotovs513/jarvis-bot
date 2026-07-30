@@ -232,16 +232,44 @@ ROUTER_PROMPT = """\
 """
 
 
+# Примеры (few-shot) — резко повышают точность распознавания намерения.
+ROUTER_EXAMPLES = [
+    ("какие сегодня задачи?", '{"intent":"list","scope":"today"}'),
+    ("на сегодня есть напоминания?", '{"intent":"list","scope":"today"}'),
+    ("что у меня просрочено?", '{"intent":"list","scope":"overdue"}'),
+    ("покажи все дела", '{"intent":"list","scope":"all"}'),
+    ("что по задачам", '{"intent":"list","scope":"today"}'),
+    ("напомни завтра в 10 позвонить инвестору",
+     '{"intent":"capture","items":[{"type":"reminder","text":"Позвонить инвестору","remind_at":"2025-01-02 10:00"}]}'),
+    ("сделать лендинг и написать пост в канал",
+     '{"intent":"capture","items":[{"type":"task","text":"Сделать лендинг","remind_at":null},'
+     '{"type":"task","text":"Написать пост в канал","remind_at":null}]}'),
+    ("идея: добавить онбординг по шагам",
+     '{"intent":"capture","items":[{"type":"note","text":"Добавить онбординг по шагам","remind_at":null}]}'),
+    ("отметь лендинг готовым", '{"intent":"complete","match":"лендинг"}'),
+    ("сделал пост", '{"intent":"complete","match":"пост"}'),
+    ("перенеси звонок с инвестором на завтра в 15:00",
+     '{"intent":"reschedule","match":"звонок с инвестором","remind_at":"2025-01-02 15:00"}'),
+    ("удали заметку про онбординг", '{"intent":"delete","match":"онбординг"}'),
+    ("спасибо, ты супер", '{"intent":"chat","answer":"Всегда рада помочь! 💪"}'),
+    ("как лучше приоритизировать задачи?",
+     '{"intent":"chat","answer":"Начни с того, что двигает выручку и имеет дедлайн. '
+     'Остальное — во вторую очередь."}'),
+]
+
+
 async def route(text: str) -> dict:
     now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M (%A)")
+    messages = [{"role": "system", "content": ROUTER_PROMPT}]
+    for user_ex, assistant_ex in ROUTER_EXAMPLES:
+        messages.append({"role": "user", "content": f"Сообщение: {user_ex}"})
+        messages.append({"role": "assistant", "content": assistant_ex})
+    messages.append({"role": "user", "content": f"Текущее время: {now}.\nСообщение: {text}"})
     try:
         resp = client.chat.completions.create(
             model=LLM_MODEL,
             response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": ROUTER_PROMPT},
-                {"role": "user", "content": f"Текущее время: {now}.\nСообщение: {text}"},
-            ],
+            messages=messages,
         )
         return json.loads(resp.choices[0].message.content)
     except Exception:  # noqa: BLE001
@@ -502,7 +530,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # intent == capture (по умолчанию)
-    await do_capture(update, chat_id, plan.get("items"))
+    items = plan.get("items")
+    if not items:
+        # Подстраховка: похоже на вопрос — покажем список, а не «не поняла».
+        low = text.lower()
+        if "?" in text or any(low.startswith(w) for w in (
+                "какие", "что ", "сколько", "покажи", "есть ли", "какая", "какое")):
+            await send_list(chat_id, "today")
+            return
+    await do_capture(update, chat_id, items)
 
 
 async def on_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
