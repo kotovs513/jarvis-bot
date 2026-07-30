@@ -1,17 +1,18 @@
 """
-Джарвис — личный ассистент в Telegram для соло-фаундера.
+Джарвис — умный ассистент-агент в Telegram для соло-фаундера.
 
 Что умеет:
-  • принимает текстовые и голосовые сообщения;
-  • голос расшифровывает в текст (OpenAI Whisper);
-  • понимает, что это — задача, напоминание или заметка (умная сортировка);
-  • всё складывает в базу Notion (колонки: Название, Тип, Когда, Статус);
-  • под задачей и напоминанием — кнопка «✅ Готово» (ставит статус в Notion);
-  • напоминания присылает вовремя, а если есть дата — ещё и за день до события;
-  • каждое утро шлёт сводку задач и напоминаний на день (/today — по запросу).
+  • принимает текст и голосовые (голос расшифровывает через Whisper);
+  • ПОНИМАЕТ намерение: записать дело / показать список / отметить готовым /
+    перенести / удалить / просто ответить на вопрос;
+  • складывает задачи, напоминания и заметки в базу Notion;
+  • из одного сообщения может создать сразу несколько дел;
+  • команды словами: «отметь лендинг готовым», «перенеси на завтра», «удали…»;
+  • отвечает на вопросы: «какие задачи на сегодня?», «что просрочено?»;
+  • напоминания шлёт вовремя и за день до события;
+  • каждое утро — сводка на день (/today — по запросу).
 
 Файл рассчитан на запуск «как есть»: заполни .env, установи зависимости, запусти.
-Подробности — в README.md.
 """
 
 from __future__ import annotations
@@ -26,11 +27,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from openai import OpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -42,26 +39,20 @@ from telegram.ext import (
 )
 
 # ────────────────────────────────────────────────────────────────────────────
-# Настройки (берутся из переменных окружения / .env)
+# Настройки
 # ────────────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
 NOTION_VERSION = "2022-06-28"
-# Часовой пояс, в котором ты говоришь «завтра в 10».
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Bangkok")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-# Во сколько присылать утреннюю сводку (час по местному времени).
 MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "9"))
-# Необязательно: если задать CHAT_ID, сводка и напоминания работают сразу после
-# перезапуска (без него — после первого сообщения боту).
 CHAT_ID_ENV = os.environ.get("CHAT_ID")
 
 TZ = ZoneInfo(TIMEZONE)
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-# Куда сохраняем ID твоего чата, чтобы слать сводку/напоминания самому.
 CHAT_ID_FILE = "chat_id.txt"
 
 NOTION_HEADERS = {
@@ -70,18 +61,16 @@ NOTION_HEADERS = {
     "Content-Type": "application/json",
 }
 
-logging.basicConfig(
-    format="%(asctime)s  %(levelname)s  %(message)s", level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s  %(levelname)s  %(message)s", level=logging.INFO)
 log = logging.getLogger("jarvis")
 
 scheduler = AsyncIOScheduler(timezone=TZ)
 application: Application | None = None
-_rebuilt = False  # напоминания восстановлены из Notion в этой сессии?
+_rebuilt = False
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Память о chat_id (чтобы бот мог писать первым)
+# Память о chat_id
 # ────────────────────────────────────────────────────────────────────────────
 def save_chat_id(chat_id: int) -> None:
     try:
@@ -107,77 +96,78 @@ def load_chat_id() -> int | None:
 NOTION_TYPE_NAME = {"task": "Задача", "reminder": "Напоминание", "note": "Заметка"}
 
 
-async def notion_create(
-    title: str, kind: str = "note", when: datetime | None = None
-) -> str | None:
-    """Создаёт строку в базе Notion. Возвращает id страницы (или None при ошибке)."""
-    properties = {
+async def notion_create(title, kind="note", when=None):
+    props = {
         "Название": {"title": [{"text": {"content": title[:2000]}}]},
         "Тип": {"select": {"name": NOTION_TYPE_NAME.get(kind, "Заметка")}},
     }
     if when is not None:
-        properties["Когда"] = {"date": {"start": when.isoformat()}}
-
-    payload = {"parent": {"database_id": NOTION_DATABASE_ID}, "properties": properties}
+        props["Когда"] = {"date": {"start": when.isoformat()}}
+    payload = {"parent": {"database_id": NOTION_DATABASE_ID}, "properties": props}
     async with httpx.AsyncClient(timeout=15) as http:
-        resp = await http.post(
-            "https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=payload
-        )
-        if resp.status_code >= 300:
-            log.error("Notion create %s: %s", resp.status_code, resp.text)
+        r = await http.post("https://api.notion.com/v1/pages",
+                            headers=NOTION_HEADERS, json=payload)
+        if r.status_code >= 300:
+            log.error("Notion create %s: %s", r.status_code, r.text)
             return None
-        return resp.json().get("id")
+        return r.json().get("id")
 
 
 async def notion_mark_done(page_id: str) -> bool:
-    """Ставит Статус = Готово у страницы."""
     payload = {"properties": {"Статус": {"select": {"name": "Готово"}}}}
     async with httpx.AsyncClient(timeout=15) as http:
-        resp = await http.patch(
-            f"https://api.notion.com/v1/pages/{page_id}",
-            headers=NOTION_HEADERS,
-            json=payload,
-        )
-        if resp.status_code >= 300:
-            log.error("Notion done %s: %s", resp.status_code, resp.text)
-            return False
-        return True
+        r = await http.patch(f"https://api.notion.com/v1/pages/{page_id}",
+                            headers=NOTION_HEADERS, json=payload)
+        return r.status_code < 300
 
 
-async def notion_query_open() -> list[dict]:
-    """Возвращает открытые (Статус ≠ Готово) строки базы."""
+async def notion_set_when(page_id: str, when: datetime) -> bool:
+    payload = {"properties": {"Когда": {"date": {"start": when.isoformat()}}}}
+    async with httpx.AsyncClient(timeout=15) as http:
+        r = await http.patch(f"https://api.notion.com/v1/pages/{page_id}",
+                            headers=NOTION_HEADERS, json=payload)
+        return r.status_code < 300
+
+
+async def notion_delete(page_id: str) -> bool:
+    payload = {"archived": True}
+    async with httpx.AsyncClient(timeout=15) as http:
+        r = await http.patch(f"https://api.notion.com/v1/pages/{page_id}",
+                            headers=NOTION_HEADERS, json=payload)
+        return r.status_code < 300
+
+
+async def notion_query_open():
     payload = {
         "filter": {"property": "Статус", "select": {"does_not_equal": "Готово"}},
         "page_size": 100,
     }
     async with httpx.AsyncClient(timeout=20) as http:
-        resp = await http.post(
+        r = await http.post(
             f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query",
-            headers=NOTION_HEADERS,
-            json=payload,
-        )
-        if resp.status_code >= 300:
-            log.error("Notion query %s: %s", resp.status_code, resp.text)
+            headers=NOTION_HEADERS, json=payload)
+        if r.status_code >= 300:
+            log.error("Notion query %s: %s", r.status_code, r.text)
             return []
-        return resp.json().get("results", [])
+        return r.json().get("results", [])
 
 
-def _page_title(page: dict) -> str:
+def _title(page):
     try:
-        parts = page["properties"]["Название"]["title"]
-        return "".join(p.get("plain_text", "") for p in parts) or "(без названия)"
+        return "".join(p.get("plain_text", "")
+                    for p in page["properties"]["Название"]["title"]) or "(без названия)"
     except (KeyError, TypeError):
         return "(без названия)"
 
 
-def _page_kind(page: dict) -> str:
+def _kind(page):
     try:
         return page["properties"]["Тип"]["select"]["name"]
     except (KeyError, TypeError):
         return ""
 
 
-def _page_when(page: dict) -> datetime | None:
+def _when(page):
     try:
         start = page["properties"]["Когда"]["date"]["start"]
     except (KeyError, TypeError):
@@ -194,9 +184,9 @@ def _page_when(page: dict) -> datetime | None:
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Расшифровка голоса
+# Голос
 # ────────────────────────────────────────────────────────────────────────────
-async def transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+async def transcribe_voice(update, context):
     voice = update.message.voice or update.message.audio
     tg_file = await context.bot.get_file(voice.file_id)
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
@@ -204,169 +194,242 @@ async def transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         path = tmp.name
     try:
         with open(path, "rb") as audio:
-            result = client.audio.transcriptions.create(model="whisper-1", file=audio)
-        return result.text.strip()
+            return client.audio.transcriptions.create(
+                model="whisper-1", file=audio).text.strip()
     finally:
         os.remove(path)
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Умная сортировка
+# Слой понимания (роутер намерений)
 # ────────────────────────────────────────────────────────────────────────────
-CLASSIFY_SYSTEM_PROMPT = """\
-Ты — ассистент соло-фаундера. Тебе приходит короткое сообщение (задача, \
-напоминание или мысль). Определи тип и верни СТРОГО JSON без пояснений.
+ROUTER_PROMPT = """\
+Ты — Джарвис, умный ассистент соло-фаундера в Telegram. Тебе приходит сообщение.
+Определи, ЧТО хочет человек, и верни СТРОГО JSON без пояснений.
 
-Формат ответа:
-{
-  "type": "task" | "reminder" | "note",
-  "clean_text": "аккуратно переформулированный текст, без слов вроде 'напомни'",
-  "remind_at": "YYYY-MM-DD HH:MM" или null
-}
+Возможные намерения (intent):
+1. "capture" — человек фиксирует одно или несколько дел (задачи, напоминания, идеи).
+   Верни "items": массив, каждый элемент:
+     {"type":"task"|"reminder"|"note", "text":"аккуратная формулировка", "remind_at":"YYYY-MM-DD HH:MM"|null}
+   - reminder — если есть время («завтра в 10», «через час»); посчитай абсолютное время.
+   - task — дело без конкретного времени.
+   - note — идея/мысль/факт.
+   - Если в сообщении НЕСКОЛЬКО дел — сделай несколько элементов.
+2. "list" — человек спрашивает, что у него есть/на сегодня/просрочено.
+   Верни "scope": "today" | "overdue" | "all".
+3. "complete" — просит отметить дело выполненным. Верни "match":"о каком деле речь (ключевые слова)".
+4. "reschedule" — просит перенести дело. Верни "match" и "remind_at":"YYYY-MM-DD HH:MM".
+5. "delete" — просит удалить дело. Верни "match".
+6. "chat" — обычный вопрос, просьба совета, приветствие — то, что не про управление списком.
+   Верни "answer":"короткий полезный ответ ассистента".
 
 Правила:
-- "reminder" — если есть указание времени ("завтра в 10", "через час", "в пятницу").
-  В remind_at запиши конкретное дату-время в 24ч формате.
-- "task" — дело, которое надо сделать, но без конкретного времени.
-- "note" — идея, мысль, факт «на будущее».
-- Если время относительное ("через 2 часа") — посчитай от текущего момента.
+- Вопросы вроде «какие задачи на сегодня?», «что просрочено?», «покажи список» — это "list", НЕ capture.
+- «отметь X готовым», «сделал X», «X выполнено» — "complete".
+- «перенеси X на завтра», «сдвинь X на 15:00» — "reschedule".
+- «удали X», «убери X» — "delete".
 - Отвечай только JSON.
 """
 
 
-async def classify(text: str) -> dict:
-    now_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M (%A)")
-    resp = client.chat.completions.create(
-        model=LLM_MODEL,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": CLASSIFY_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Текущее время: {now_str}.\nСообщение: {text}"},
-        ],
-    )
+async def route(text: str) -> dict:
+    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M (%A)")
     try:
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": ROUTER_PROMPT},
+                {"role": "user", "content": f"Текущее время: {now}.\nСообщение: {text}"},
+            ],
+        )
         return json.loads(resp.choices[0].message.content)
-    except (json.JSONDecodeError, KeyError):
-        return {"type": "note", "clean_text": text, "remind_at": None}
+    except Exception:  # noqa: BLE001
+        log.exception("Ошибка роутера")
+        return {"intent": "capture",
+                "items": [{"type": "note", "text": text, "remind_at": None}]}
+
+
+async def pick_target(match: str, pages: list[dict]) -> dict | None:
+    """Выбирает наиболее подходящее дело из списка по описанию пользователя."""
+    if not pages:
+        return None
+    listing = "\n".join(f"{i}. {_title(p)}" for i, p in enumerate(pages))
+    try:
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content":
+                "Верни JSON {\"index\": N} — номер самого подходящего дела из списка "
+                "под запрос пользователя, или {\"index\": null} если ничего не подходит."},
+                {"role": "user", "content": f"Запрос: {match}\n\nСписок:\n{listing}"},
+            ],
+        )
+        idx = json.loads(resp.choices[0].message.content).get("index")
+        if isinstance(idx, int) and 0 <= idx < len(pages):
+            return pages[idx]
+    except Exception:  # noqa: BLE001
+        log.exception("Ошибка выбора дела")
+    return None
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # Напоминания
 # ────────────────────────────────────────────────────────────────────────────
-async def fire_reminder(chat_id: int, text: str) -> None:
-    if application is None:
-        return
-    await application.bot.send_message(chat_id=chat_id, text=f"⏰ Напоминание: {text}")
+async def fire_reminder(chat_id, text):
+    if application:
+        await application.bot.send_message(chat_id=chat_id, text=f"⏰ Напоминание: {text}")
 
 
-async def fire_pre_reminder(chat_id: int, text: str, when_str: str) -> None:
-    if application is None:
-        return
-    await application.bot.send_message(
-        chat_id=chat_id, text=f"📅 Завтра ({when_str}): {text}"
-    )
+async def fire_pre_reminder(chat_id, text, when_str):
+    if application:
+        await application.bot.send_message(
+            chat_id=chat_id, text=f"📅 Завтра ({when_str}): {text}")
 
 
-def schedule_reminder(page_id: str, chat_id: int, when: datetime, text: str) -> None:
-    """Ставит напоминание на момент события и (если успеваем) за день до него."""
+def schedule_reminder(page_id, chat_id, when, text):
     now = datetime.now(TZ)
     if when > now:
-        scheduler.add_job(
-            fire_reminder,
-            "date",
-            run_date=when,
-            args=[chat_id, text],
-            id=f"remind:{page_id}",
-            replace_existing=True,
-            misfire_grace_time=3600,
-        )
+        scheduler.add_job(fire_reminder, "date", run_date=when, args=[chat_id, text],
+                        id=f"remind:{page_id}", replace_existing=True,
+                        misfire_grace_time=3600)
     pre = when - timedelta(days=1)
     if pre > now:
-        scheduler.add_job(
-            fire_pre_reminder,
-            "date",
-            run_date=pre,
-            args=[chat_id, text, when.strftime("%d.%m в %H:%M")],
-            id=f"pre:{page_id}",
-            replace_existing=True,
-            misfire_grace_time=3600,
-        )
+        scheduler.add_job(fire_pre_reminder, "date", run_date=pre,
+                        args=[chat_id, text, when.strftime("%d.%m в %H:%M")],
+                        id=f"pre:{page_id}", replace_existing=True, misfire_grace_time=3600)
 
 
-async def rebuild_reminders(chat_id: int) -> None:
-    """Восстанавливает будущие напоминания из Notion (переживает перезапуск)."""
+def unschedule_reminder(page_id):
+    for jid in (f"remind:{page_id}", f"pre:{page_id}"):
+        try:
+            scheduler.remove_job(jid)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def rebuild_reminders(chat_id):
     global _rebuilt
     _rebuilt = True
-    count = 0
+    n = 0
     for page in await notion_query_open():
-        if _page_kind(page) != "Напоминание":
+        if _kind(page) != "Напоминание":
             continue
-        when = _page_when(page)
-        if when and when > datetime.now(TZ):
-            schedule_reminder(page["id"], chat_id, when, _page_title(page))
-            count += 1
-    if count:
-        log.info("Восстановлено напоминаний из Notion: %d", count)
+        w = _when(page)
+        if w and w > datetime.now(TZ):
+            schedule_reminder(page["id"], chat_id, w, _title(page))
+            n += 1
+    if n:
+        log.info("Восстановлено напоминаний: %d", n)
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Утренняя сводка
+# Списки / сводка
 # ────────────────────────────────────────────────────────────────────────────
-def build_summary(pages: list[dict]) -> str:
+def build_list(pages, scope, greeting=False):
     now = datetime.now(TZ)
     today = now.date()
-    today_reminders, overdue, tasks = [], [], []
-    for page in pages:
-        kind = _page_kind(page)
-        title = _page_title(page)
-        when = _page_when(page)
-        if kind == "Напоминание" and when:
-            if when.date() < today:
-                overdue.append(f"• {title} (было {when.strftime('%d.%m %H:%M')})")
-            elif when.date() == today:
-                today_reminders.append(f"• {when.strftime('%H:%M')} — {title}")
-        elif kind == "Задача":
-            tasks.append(f"• {title}")
+    today_rem, overdue, future_rem, tasks = [], [], [], []
+    for p in pages:
+        k, t, w = _kind(p), _title(p), _when(p)
+        if k == "Напоминание" and w:
+            if w.date() < today:
+                overdue.append((w, f"• {t} (было {w.strftime('%d.%m %H:%M')})"))
+            elif w.date() == today:
+                today_rem.append((w, f"• {w.strftime('%H:%M')} — {t}"))
+            else:
+                future_rem.append((w, f"• {w.strftime('%d.%m %H:%M')} — {t}"))
+        elif k == "Задача":
+            tasks.append(f"• {t}")
 
-    if not (today_reminders or overdue or tasks):
-        return "☀️ Доброе утро! На сегодня всё чисто — задач и напоминаний нет ✨"
+    def srt(lst):
+        return [x for _, x in sorted(lst)]
 
-    lines = ["☀️ Доброе утро! Вот план на сегодня:"]
-    if today_reminders:
-        lines.append("\n⏰ Напоминания на сегодня:")
-        lines += sorted(today_reminders)
-    if overdue:
-        lines.append("\n🔴 Просрочено:")
-        lines += overdue
-    if tasks:
-        lines.append("\n✅ Открытые задачи:")
-        lines += tasks
-    return "\n".join(lines)
+    blocks = []
+    if scope == "overdue":
+        if overdue:
+            blocks.append("🔴 Просрочено:\n" + "\n".join(srt(overdue)))
+    elif scope == "all":
+        if today_rem:
+            blocks.append("⏰ Сегодня:\n" + "\n".join(srt(today_rem)))
+        if future_rem:
+            blocks.append("📅 Дальше:\n" + "\n".join(srt(future_rem)))
+        if overdue:
+            blocks.append("🔴 Просрочено:\n" + "\n".join(srt(overdue)))
+        if tasks:
+            blocks.append("✅ Задачи:\n" + "\n".join(tasks))
+    else:  # today
+        if today_rem:
+            blocks.append("⏰ Напоминания на сегодня:\n" + "\n".join(srt(today_rem)))
+        if overdue:
+            blocks.append("🔴 Просрочено:\n" + "\n".join(srt(overdue)))
+        if tasks:
+            blocks.append("✅ Открытые задачи:\n" + "\n".join(tasks))
+
+    if not blocks:
+        return ("☀️ Доброе утро! На сегодня всё чисто ✨" if greeting
+                else "Пусто — ни задач, ни напоминаний ✨")
+    head = "☀️ Доброе утро! Вот план на сегодня:\n\n" if greeting else ""
+    return head + "\n\n".join(blocks)
 
 
-async def send_summary(chat_id: int) -> None:
-    if application is None:
-        return
-    pages = await notion_query_open()
-    await application.bot.send_message(chat_id=chat_id, text=build_summary(pages))
+async def send_list(chat_id, scope="today", greeting=False):
+    if application:
+        pages = await notion_query_open()
+        await application.bot.send_message(chat_id=chat_id,
+                                        text=build_list(pages, scope, greeting))
 
 
-async def morning_job() -> None:
+async def morning_job():
     chat_id = load_chat_id()
     if chat_id is None:
-        log.info("Утренняя сводка пропущена: неизвестен chat_id.")
+        log.info("Утренняя сводка пропущена: нет chat_id.")
         return
-    await send_summary(chat_id)
+    await send_list(chat_id, "today", greeting=True)
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Обработчик сообщений
+# Обработка сообщений
 # ────────────────────────────────────────────────────────────────────────────
 EMOJI = {"task": "✅", "reminder": "⏰", "note": "💡"}
-LABEL_RU = {"task": "Задача", "reminder": "Напоминание", "note": "Заметка"}
+LABEL = {"task": "задача", "reminder": "напоминание", "note": "заметка"}
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def done_markup(page_id):
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Готово", callback_data=f"done:{page_id}")]])
+
+
+async def do_capture(update, chat_id, items):
+    if not items:
+        await update.message.reply_text("Не поняла, что записать 🤔")
+        return
+    for it in items:
+        kind = it.get("type", "note")
+        text = (it.get("text") or "").strip()
+        if not text:
+            continue
+        when = None
+        if kind == "reminder" and it.get("remind_at"):
+            try:
+                p = datetime.strptime(it["remind_at"], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+                if p > datetime.now(TZ):
+                    when = p
+            except ValueError:
+                pass
+        page_id = await notion_create(text, kind, when)
+        reply = f"{EMOJI.get(kind, '💡')} Записала как «{LABEL.get(kind, 'заметка')}»: {text}"
+        if kind == "reminder" and when and page_id:
+            schedule_reminder(page_id, chat_id, when, text)
+            reply += f"\n🔔 Напомню {when.strftime('%d.%m в %H:%M')}"
+            if when - timedelta(days=1) > datetime.now(TZ):
+                reply += " (и за день до)"
+        markup = done_markup(page_id) if kind in ("task", "reminder") and page_id else None
+        await update.message.reply_text(reply, reply_markup=markup)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     save_chat_id(chat_id)
     if not _rebuilt:
@@ -385,54 +448,69 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not text:
         return
 
-    try:
-        data = await classify(text)
-    except Exception:  # noqa: BLE001
-        log.exception("Ошибка классификации")
-        data = {"type": "note", "clean_text": text, "remind_at": None}
+    await context.bot.send_chat_action(chat_id, "typing")
+    plan = await route(text)
+    intent = plan.get("intent", "capture")
 
-    kind = data.get("type", "note")
-    clean = data.get("clean_text", text)
-    emoji = EMOJI.get(kind, "💡")
+    if intent == "list":
+        await send_list(chat_id, plan.get("scope", "today"))
+        return
 
-    run_at: datetime | None = None
-    if kind == "reminder" and data.get("remind_at"):
-        try:
-            parsed = datetime.strptime(data["remind_at"], "%Y-%m-%d %H:%M").replace(
-                tzinfo=TZ
-            )
-            if parsed > datetime.now(TZ):
-                run_at = parsed
-        except ValueError:
-            log.warning("Не смог разобрать время: %s", data.get("remind_at"))
+    if intent == "chat":
+        answer = plan.get("answer") or "Чем помочь?"
+        await update.message.reply_text(answer)
+        return
 
-    page_id = await notion_create(clean, kind, run_at)
+    if intent in ("complete", "reschedule", "delete"):
+        pages = await notion_query_open()
+        target = await pick_target(plan.get("match", text), pages)
+        if not target:
+            await update.message.reply_text(
+                "Не нашла подходящее дело 🤔 Уточни, что именно.")
+            return
+        title = _title(target)
+        pid = target["id"]
 
-    reply = f"{emoji} Записала как «{LABEL_RU.get(kind, 'Заметка').lower()}»: {clean}"
-    if kind == "reminder":
-        if run_at is not None and page_id:
-            schedule_reminder(page_id, chat_id, run_at, clean)
-            reply += f"\n🔔 Напомню {run_at.strftime('%d.%m в %H:%M')}"
-            if run_at - timedelta(days=1) > datetime.now(TZ):
-                reply += " (и за день до)"
-        elif data.get("remind_at"):
-            reply += "\n(время уже прошло — напоминание не поставила)"
+        if intent == "complete":
+            ok = await notion_mark_done(pid)
+            unschedule_reminder(pid)
+            await update.message.reply_text(
+                f"✅ Отметила готовым: {title}" if ok else "Не вышло обновить Notion 😕")
+        elif intent == "delete":
+            ok = await notion_delete(pid)
+            unschedule_reminder(pid)
+            await update.message.reply_text(
+                f"🗑 Удалила: {title}" if ok else "Не вышло удалить 😕")
+        else:  # reschedule
+            when = None
+            if plan.get("remind_at"):
+                try:
+                    when = datetime.strptime(
+                        plan["remind_at"], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+                except ValueError:
+                    pass
+            if not when:
+                await update.message.reply_text("Не поняла, на когда перенести 🤔")
+                return
+            ok = await notion_set_when(pid, when)
+            if ok:
+                schedule_reminder(pid, chat_id, when, title)
+                await update.message.reply_text(
+                    f"🔄 Перенесла «{title}» на {when.strftime('%d.%m в %H:%M')}")
+            else:
+                await update.message.reply_text("Не вышло перенести 😕")
+        return
 
-    # Кнопка «Готово» для задач и напоминаний.
-    markup = None
-    if kind in ("task", "reminder") and page_id:
-        markup = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("✅ Готово", callback_data=f"done:{page_id}")]]
-        )
-    await update.message.reply_text(reply, reply_markup=markup)
+    # intent == capture (по умолчанию)
+    await do_capture(update, chat_id, plan.get("items"))
 
 
-async def on_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    page_id = query.data.split(":", 1)[1]
-    ok = await notion_mark_done(page_id)
-    if ok:
-        await query.answer("Отметила как готово ✅")
+    pid = query.data.split(":", 1)[1]
+    if await notion_mark_done(pid):
+        unschedule_reminder(pid)
+        await query.answer("Готово ✅")
         try:
             await query.edit_message_text(f"✅ Готово: {query.message.text}")
         except Exception:  # noqa: BLE001
@@ -444,60 +522,46 @@ async def on_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ────────────────────────────────────────────────────────────────────────────
 # Команды
 # ────────────────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_start(update, context):
     save_chat_id(update.effective_chat.id)
     await update.message.reply_text(
-        "Привет! Я твой Джарвис 🤖\n\n"
-        "Пиши мне или шли голосовые — я сам пойму, что это:\n"
-        "✅ задача, ⏰ напоминание или 💡 заметка, и всё сложу в Notion.\n\n"
-        "• напоминания пришлю вовремя, а если есть дата — ещё и за день до;\n"
-        "• под задачей будет кнопка «Готово»;\n"
-        "• каждое утро пришлю план на день (или команда /today).\n\n"
-        "Примеры:\n"
-        "• «напомни завтра в 10 позвонить инвестору»\n"
-        "• «сделать лендинг к пятнице»\n"
-        "• «идея: добавить онбординг по шагам»"
-    )
+        "Привет! Я твой Джарвис 🤖 — теперь понимаю тебя по-настоящему.\n\n"
+        "Можешь:\n"
+        "• записывать дела — «напомни завтра в 10 позвонить», «сделать лендинг»;\n"
+        "• спрашивать — «какие задачи на сегодня?», «что просрочено?»;\n"
+        "• командовать — «отметь лендинг готовым», «перенеси на завтра», «удали…»;\n"
+        "• кидать несколько дел одним сообщением;\n"
+        "• просто спросить совет.\n\n"
+        "Всё складываю в Notion, напоминания пришлю вовремя. Команда /today — план на день.")
 
 
-async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_today(update, context):
     save_chat_id(update.effective_chat.id)
-    await send_summary(update.effective_chat.id)
+    await send_list(update.effective_chat.id, "today")
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # Запуск
 # ────────────────────────────────────────────────────────────────────────────
-async def on_startup(app: Application) -> None:
+async def on_startup(app):
     chat_id = load_chat_id()
     if chat_id is not None:
         await rebuild_reminders(chat_id)
 
 
-def main() -> None:
+def main():
     global application
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
-
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("today", cmd_today))
     application.add_handler(CallbackQueryHandler(on_done, pattern=r"^done:"))
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND | filters.VOICE | filters.AUDIO,
-            handle_message,
-        )
-    )
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND | filters.VOICE | filters.AUDIO, handle_message))
 
-    scheduler.add_job(
-        morning_job,
-        "cron",
-        hour=MORNING_HOUR,
-        minute=0,
-        id="morning",
-        replace_existing=True,
-    )
+    scheduler.add_job(morning_job, "cron", hour=MORNING_HOUR, minute=0,
+                    id="morning", replace_existing=True)
     scheduler.start()
-    log.info("Джарвис запущен. Пояс: %s, сводка в %02d:00.", TIMEZONE, MORNING_HOUR)
+    log.info("Джарвис-агент запущен. Пояс: %s, сводка в %02d:00.", TIMEZONE, MORNING_HOUR)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
