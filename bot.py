@@ -94,15 +94,19 @@ def load_chat_id() -> int | None:
 # Notion
 # ────────────────────────────────────────────────────────────────────────────
 NOTION_TYPE_NAME = {"task": "Задача", "reminder": "Напоминание", "note": "Заметка"}
+REPEAT_RU = {"monthly": "Ежемесячно", "weekly": "Еженедельно", "daily": "Ежедневно"}
+REPEAT_FROM_RU = {v: k for k, v in REPEAT_RU.items()}
 
 
-async def notion_create(title, kind="note", when=None):
+async def notion_create(title, kind="note", when=None, repeat=None):
     props = {
         "Название": {"title": [{"text": {"content": title[:2000]}}]},
         "Тип": {"select": {"name": NOTION_TYPE_NAME.get(kind, "Заметка")}},
     }
     if when is not None:
         props["Когда"] = {"date": {"start": when.isoformat()}}
+    if repeat in REPEAT_RU:
+        props["Повтор"] = {"select": {"name": REPEAT_RU[repeat]}}
     payload = {"parent": {"database_id": NOTION_DATABASE_ID}, "properties": props}
     async with httpx.AsyncClient(timeout=15) as http:
         r = await http.post("https://api.notion.com/v1/pages",
@@ -183,6 +187,48 @@ def _when(page):
     return dt.astimezone(TZ)
 
 
+def _repeat(page):
+    """Возвращает 'monthly'/'weekly'/'daily' или None."""
+    try:
+        name = page["properties"]["Повтор"]["select"]["name"]
+    except (KeyError, TypeError):
+        return None
+    return REPEAT_FROM_RU.get(name)
+
+
+def add_month(dt):
+    import calendar
+    y, m = dt.year, dt.month + 1
+    if m > 12:
+        m, y = 1, y + 1
+    return dt.replace(year=y, month=m, day=min(dt.day, calendar.monthrange(y, m)[1]))
+
+
+def next_occurrence(base, repeat):
+    """Ближайшее будущее срабатывание повтора (для отображения в списке)."""
+    now = datetime.now(TZ)
+    nxt = base
+    if repeat == "daily":
+        nxt = now.replace(hour=base.hour, minute=base.minute, second=0, microsecond=0)
+        if nxt <= now:
+            nxt += timedelta(days=1)
+    elif repeat == "weekly":
+        nxt = now.replace(hour=base.hour, minute=base.minute, second=0, microsecond=0)
+        days = (base.weekday() - now.weekday()) % 7
+        nxt += timedelta(days=days)
+        if nxt <= now:
+            nxt += timedelta(days=7)
+    elif repeat == "monthly":
+        import calendar
+        y, m = now.year, now.month
+        day = min(base.day, calendar.monthrange(y, m)[1])
+        nxt = now.replace(day=day, hour=base.hour, minute=base.minute,
+                        second=0, microsecond=0)
+        if nxt <= now:
+            nxt = add_month(nxt)
+    return nxt
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Голос
 # ────────────────────────────────────────────────────────────────────────────
@@ -210,10 +256,15 @@ ROUTER_PROMPT = """\
 Возможные намерения (intent):
 1. "capture" — человек фиксирует одно или несколько дел (задачи, напоминания, идеи).
    Верни "items": массив, каждый элемент:
-     {"type":"task"|"reminder"|"note", "text":"аккуратная формулировка", "remind_at":"YYYY-MM-DD HH:MM"|null}
+     {"type":"task"|"reminder"|"note", "text":"аккуратная формулировка",
+      "remind_at":"YYYY-MM-DD HH:MM"|null, "repeat":"monthly"|"weekly"|"daily"|null}
    - reminder — если есть время («завтра в 10», «через час»); посчитай абсолютное время.
    - task — дело без конкретного времени.
    - note — идея/мысль/факт.
+   - repeat: если дело повторяется — «каждый месяц/ежемесячно» → "monthly",
+     «каждую неделю» → "weekly", «каждый день» → "daily". Иначе null.
+     Для повтора в remind_at укажи БЛИЖАЙШУЮ дату нужного дня/времени
+     (если время не названо — 10:00). Повтор — это всегда type "reminder".
    - Если в сообщении НЕСКОЛЬКО дел — сделай несколько элементов.
 2. "list" — человек спрашивает, что у него есть/на сегодня/просрочено.
    Верни "scope": "today" | "overdue" | "all".
@@ -246,6 +297,12 @@ ROUTER_EXAMPLES = [
      '{"type":"task","text":"Написать пост в канал","remind_at":null}]}'),
     ("идея: добавить онбординг по шагам",
      '{"intent":"capture","items":[{"type":"note","text":"Добавить онбординг по шагам","remind_at":null}]}'),
+    ("каждый месяц 8 числа оплата Leonardo",
+     '{"intent":"capture","items":[{"type":"reminder","text":"Оплата Leonardo",'
+     '"remind_at":"2025-01-08 10:00","repeat":"monthly"}]}'),
+    ("напоминай ежемесячно 1 числа платить за подписки",
+     '{"intent":"capture","items":[{"type":"reminder","text":"Оплатить подписки",'
+     '"remind_at":"2025-01-01 10:00","repeat":"monthly"}]}'),
     ("отметь лендинг готовым", '{"intent":"complete","match":"лендинг"}'),
     ("сделал пост", '{"intent":"complete","match":"пост"}'),
     ("перенеси звонок с инвестором на завтра в 15:00",
@@ -305,6 +362,9 @@ async def pick_target(match: str, pages: list[dict]) -> dict | None:
 # ────────────────────────────────────────────────────────────────────────────
 # Напоминания
 # ────────────────────────────────────────────────────────────────────────────
+REPEAT_WORD = {"monthly": "ежемесячно", "weekly": "еженедельно", "daily": "ежедневно"}
+
+
 async def fire_reminder(chat_id, text):
     if application:
         await application.bot.send_message(chat_id=chat_id, text=f"⏰ Напоминание: {text}")
@@ -316,8 +376,25 @@ async def fire_pre_reminder(chat_id, text, when_str):
             chat_id=chat_id, text=f"📅 Завтра ({when_str}): {text}")
 
 
-def schedule_reminder(page_id, chat_id, when, text):
+async def fire_recurring(chat_id, text, repeat):
+    if application:
+        word = REPEAT_WORD.get(repeat, "повтор")
+        await application.bot.send_message(
+            chat_id=chat_id, text=f"🔁 Напоминание ({word}): {text}")
+
+
+def schedule_reminder(page_id, chat_id, when, text, repeat=None):
     now = datetime.now(TZ)
+    if repeat in ("monthly", "weekly", "daily"):
+        kw = {"hour": when.hour, "minute": when.minute}
+        if repeat == "monthly":
+            kw["day"] = when.day
+        elif repeat == "weekly":
+            kw["day_of_week"] = when.weekday()
+        scheduler.add_job(fire_recurring, "cron", args=[chat_id, text, repeat],
+                        id=f"remind:{page_id}", replace_existing=True,
+                        misfire_grace_time=3600, **kw)
+        return
     if when > now:
         scheduler.add_job(fire_reminder, "date", run_date=when, args=[chat_id, text],
                         id=f"remind:{page_id}", replace_existing=True,
@@ -344,8 +421,11 @@ async def rebuild_reminders(chat_id):
     for page in await notion_query_open():
         if _kind(page) != "Напоминание":
             continue
-        w = _when(page)
-        if w and w > datetime.now(TZ):
+        w, rep = _when(page), _repeat(page)
+        if rep and w:
+            schedule_reminder(page["id"], chat_id, w, _title(page), rep)
+            n += 1
+        elif w and w > datetime.now(TZ):
             schedule_reminder(page["id"], chat_id, w, _title(page))
             n += 1
     if n:
@@ -356,28 +436,43 @@ async def rebuild_reminders(chat_id):
 # Списки / сводка
 # ────────────────────────────────────────────────────────────────────────────
 def build_list(pages, scope, greeting=False):
+    """Возвращает (текст, actionable) — actionable: список (page_id, короткий_титул)."""
     now = datetime.now(TZ)
     today = now.date()
     today_rem, overdue, future_rem, tasks = [], [], [], []
+    # кандидаты на кнопки по категориям (повторяющиеся не берём — они не «готовятся»)
+    act = {"today_rem": [], "overdue": [], "future_rem": [], "task": []}
     for p in pages:
-        k, t, w = _kind(p), _title(p), _when(p)
-        if k == "Напоминание" and w:
+        k, t, pid = _kind(p), _title(p), p["id"]
+        if k == "Напоминание":
+            rep, w = _repeat(p), _when(p)
+            if rep and w:
+                nxt = next_occurrence(w, rep)
+                line = f"🔁 {nxt.strftime('%d.%m %H:%M')} — {t} ({REPEAT_WORD.get(rep, '')})"
+                (today_rem if nxt.date() == today else future_rem).append((nxt, line))
+                continue
+            if not w:
+                tasks.append(f"• {t}"); act["task"].append((pid, t)); continue
             if w.date() < today:
                 overdue.append((w, f"• {t} (было {w.strftime('%d.%m %H:%M')})"))
+                act["overdue"].append((pid, t))
             elif w.date() == today:
                 today_rem.append((w, f"• {w.strftime('%H:%M')} — {t}"))
+                act["today_rem"].append((pid, t))
             else:
                 future_rem.append((w, f"• {w.strftime('%d.%m %H:%M')} — {t}"))
+                act["future_rem"].append((pid, t))
         elif k == "Задача":
-            tasks.append(f"• {t}")
+            tasks.append(f"• {t}"); act["task"].append((pid, t))
 
     def srt(lst):
         return [x for _, x in sorted(lst)]
 
-    blocks = []
+    blocks, cats = [], []
     if scope == "overdue":
         if overdue:
             blocks.append("🔴 Просрочено:\n" + "\n".join(srt(overdue)))
+        cats = ["overdue"]
     elif scope == "all":
         if today_rem:
             blocks.append("⏰ Сегодня:\n" + "\n".join(srt(today_rem)))
@@ -387,6 +482,7 @@ def build_list(pages, scope, greeting=False):
             blocks.append("🔴 Просрочено:\n" + "\n".join(srt(overdue)))
         if tasks:
             blocks.append("✅ Задачи:\n" + "\n".join(tasks))
+        cats = ["today_rem", "overdue", "future_rem", "task"]
     else:  # today
         if today_rem:
             blocks.append("⏰ Напоминания на сегодня:\n" + "\n".join(srt(today_rem)))
@@ -394,19 +490,29 @@ def build_list(pages, scope, greeting=False):
             blocks.append("🔴 Просрочено:\n" + "\n".join(srt(overdue)))
         if tasks:
             blocks.append("✅ Открытые задачи:\n" + "\n".join(tasks))
+        cats = ["today_rem", "overdue", "task"]
+
+    actionable = [item for c in cats for item in act[c]]
 
     if not blocks:
-        return ("☀️ Доброе утро! На сегодня всё чисто ✨" if greeting
+        text = ("☀️ Доброе утро! На сегодня всё чисто ✨" if greeting
                 else "Пусто — ни задач, ни напоминаний ✨")
+        return text, []
     head = "☀️ Доброе утро! Вот план на сегодня:\n\n" if greeting else ""
-    return head + "\n\n".join(blocks)
+    return head + "\n\n".join(blocks), actionable
 
 
 async def send_list(chat_id, scope="today", greeting=False):
-    if application:
-        pages = await notion_query_open()
-        await application.bot.send_message(chat_id=chat_id,
-                                        text=build_list(pages, scope, greeting))
+    if not application:
+        return
+    pages = await notion_query_open()
+    text, actionable = build_list(pages, scope, greeting)
+    markup = None
+    if actionable:
+        rows = [[InlineKeyboardButton(f"✅ {short[:32]}", callback_data=f"done:{pid}")]
+                for pid, short in actionable[:12]]
+        markup = InlineKeyboardMarkup(rows)
+    await application.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
 
 
 async def morning_job():
@@ -438,22 +544,38 @@ async def do_capture(update, chat_id, items):
         text = (it.get("text") or "").strip()
         if not text:
             continue
+        repeat = it.get("repeat")
+        if repeat not in ("monthly", "weekly", "daily"):
+            repeat = None
         when = None
-        if kind == "reminder" and it.get("remind_at"):
+        if it.get("remind_at"):
             try:
                 p = datetime.strptime(it["remind_at"], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
-                if p > datetime.now(TZ):
+                # для повтора базовая дата нужна всегда; для разового — только будущее
+                if repeat or p > datetime.now(TZ):
                     when = p
             except ValueError:
                 pass
-        page_id = await notion_create(text, kind, when)
+        if repeat:
+            kind = "reminder"
+        page_id = await notion_create(text, kind, when, repeat)
         reply = f"{EMOJI.get(kind, '💡')} Записала как «{LABEL.get(kind, 'заметка')}»: {text}"
-        if kind == "reminder" and when and page_id:
+
+        if repeat and when and page_id:
+            schedule_reminder(page_id, chat_id, when, text, repeat)
+            nxt = next_occurrence(when, repeat)
+            reply += (f"\n🔁 Буду напоминать {REPEAT_WORD[repeat]}, "
+                    f"ближайшее — {nxt.strftime('%d.%m в %H:%M')}")
+            markup = None  # повтор не «готовят» — чтобы отключить, скажи «удали …»
+        elif kind == "reminder" and when and page_id:
             schedule_reminder(page_id, chat_id, when, text)
             reply += f"\n🔔 Напомню {when.strftime('%d.%m в %H:%M')}"
             if when - timedelta(days=1) > datetime.now(TZ):
                 reply += " (и за день до)"
-        markup = done_markup(page_id) if kind in ("task", "reminder") and page_id else None
+            markup = done_markup(page_id)
+        else:
+            markup = done_markup(page_id) if kind in ("task", "reminder") and page_id else None
+
         await update.message.reply_text(reply, reply_markup=markup)
 
 
@@ -566,9 +688,11 @@ async def cmd_start(update, context):
         "• записывать дела — «напомни завтра в 10 позвонить», «сделать лендинг»;\n"
         "• спрашивать — «какие задачи на сегодня?», «что просрочено?»;\n"
         "• командовать — «отметь лендинг готовым», «перенеси на завтра», «удали…»;\n"
+        "• ставить повторы — «каждый месяц 8 числа оплата Leonardo»;\n"
         "• кидать несколько дел одним сообщением;\n"
         "• просто спросить совет.\n\n"
-        "Всё складываю в Notion, напоминания пришлю вовремя. Команда /today — план на день.")
+        "Всё складываю в Notion, напоминания пришлю вовремя. Команда /today — план на "
+        "день (прямо там кнопки «Готово», листать не надо).")
 
 
 async def cmd_today(update, context):
