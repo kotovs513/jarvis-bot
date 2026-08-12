@@ -27,7 +27,10 @@ from zoneinfo import ZoneInfo
 import httpx
 from openai import OpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -529,6 +532,29 @@ async def morning_job():
 EMOJI = {"task": "✅", "reminder": "⏰", "note": "💡"}
 LABEL = {"task": "задача", "reminder": "напоминание", "note": "заметка"}
 
+# Постоянное меню-клавиатура снизу (как в Friday Assistant).
+BTN_TODAY, BTN_ALL, BTN_OVERDUE, BTN_HELP = (
+    "📋 Сегодня", "📌 Все дела", "🔴 Просрочено", "❓ Помощь")
+MAIN_KB = ReplyKeyboardMarkup(
+    [[BTN_TODAY, BTN_ALL], [BTN_OVERDUE, BTN_HELP]],
+    resize_keyboard=True, is_persistent=True,
+)
+
+HELP_TEXT = (
+    "Я твой Джарвис 🤖\n\n"
+    "Кнопки снизу:\n"
+    "📋 Сегодня — план на сегодня\n"
+    "📌 Все дела — все открытые задачи и напоминания\n"
+    "🔴 Просрочено — что пропущено\n\n"
+    "А ещё просто пиши или говори голосом:\n"
+    "• «напомни завтра в 10 позвонить» — напоминание;\n"
+    "• «сделать лендинг» — задача;\n"
+    "• «каждый месяц 8 числа оплата Leonardo» — повтор;\n"
+    "• «отметь лендинг готовым», «перенеси на пятницу», «удали…» — команды;\n"
+    "• «какие задачи на сегодня?» — покажу список.\n\n"
+    "Готовое отмечай кнопкой ✅ прямо под списком."
+)
+
 
 def done_markup(page_id):
     return InlineKeyboardMarkup(
@@ -597,6 +623,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (update.message.text or "").strip()
     if not text:
         return
+
+    # Кнопки меню — обрабатываем сразу, без LLM.
+    if text == BTN_TODAY:
+        await send_list(chat_id, "today"); return
+    if text == BTN_ALL:
+        await send_list(chat_id, "all"); return
+    if text == BTN_OVERDUE:
+        await send_list(chat_id, "overdue"); return
+    if text == BTN_HELP:
+        await update.message.reply_text(HELP_TEXT, reply_markup=MAIN_KB); return
 
     await context.bot.send_chat_action(chat_id, "typing")
     plan = await route(text)
@@ -691,8 +727,9 @@ async def cmd_start(update, context):
         "• ставить повторы — «каждый месяц 8 числа оплата Leonardo»;\n"
         "• кидать несколько дел одним сообщением;\n"
         "• просто спросить совет.\n\n"
-        "Всё складываю в Notion, напоминания пришлю вовремя. Команда /today — план на "
-        "день (прямо там кнопки «Готово», листать не надо).")
+        "Всё складываю в Notion, напоминания пришлю вовремя.\n\n"
+        "Снизу — меню: 📋 Сегодня, 📌 Все дела, 🔴 Просрочено, ❓ Помощь.",
+        reply_markup=MAIN_KB)
 
 
 async def cmd_today(update, context):
